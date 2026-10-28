@@ -295,7 +295,7 @@ add rule inet ovn-kubernetes udn-isolation ip6 daddr @udn-pod-default-ips-v6 dro
 		Expect(err).NotTo(HaveOccurred())
 
 		// Copy manager.Start() sequence, but using fake nft and without running systemd tracker
-		manager.kubeletCgroupPath = "kubelet.slice/kubelet.service"
+		manager.kubeletCgroupPaths = []string{"kubelet.slice/kubelet.service"}
 		nft = nodenft.SetFakeNFTablesHelper()
 		manager.nft = nft
 		err = manager.setupUDNIsolationFromHost()
@@ -596,7 +596,7 @@ var _ = Describe("UDN Host isolation setup", func() {
 
 	// expectedDump returns the isolation ruleset, with the kubelet rule only when a
 	// kubelet cgroup path is known.
-	expectedDump := func(kubeletCgroupPath string) string {
+	expectedDump := func(kubeletCgroupPaths ...string) string {
 		result := `add table inet ovn-kubernetes
 add chain inet ovn-kubernetes udn-isolation { type filter hook output priority 0 ; comment "Host isolation for user defined networks" ; }
 add set inet ovn-kubernetes udn-open-ports-icmp-v4 { type ipv4_addr ; comment "default network IPs of pods in user defined networks that allow ICMP (IPv4)" ; }
@@ -608,7 +608,7 @@ add set inet ovn-kubernetes udn-pod-default-ips-v6 { type ipv6_addr ; comment "d
 add rule inet ovn-kubernetes udn-isolation ip daddr . meta l4proto . th dport @udn-open-ports-v4 accept
 add rule inet ovn-kubernetes udn-isolation ip daddr @udn-open-ports-icmp-v4 meta l4proto icmp accept
 `
-		if kubeletCgroupPath != "" {
+		for _, kubeletCgroupPath := range kubeletCgroupPaths {
 			result += fmt.Sprintf("add rule inet ovn-kubernetes udn-isolation socket cgroupv2 %s %q ip daddr @udn-pod-default-ips-v4 accept\n",
 				cgroupv2Level(kubeletCgroupPath), kubeletCgroupPath)
 		}
@@ -616,7 +616,7 @@ add rule inet ovn-kubernetes udn-isolation ip daddr @udn-open-ports-icmp-v4 meta
 add rule inet ovn-kubernetes udn-isolation ip6 daddr . meta l4proto . th dport @udn-open-ports-v6 accept
 add rule inet ovn-kubernetes udn-isolation ip6 daddr @udn-open-ports-icmp-v6 meta l4proto icmpv6 accept
 `
-		if kubeletCgroupPath != "" {
+		for _, kubeletCgroupPath := range kubeletCgroupPaths {
 			result += fmt.Sprintf("add rule inet ovn-kubernetes udn-isolation socket cgroupv2 %s %q ip6 daddr @udn-pod-default-ips-v6 accept\n",
 				cgroupv2Level(kubeletCgroupPath), kubeletCgroupPath)
 		}
@@ -664,7 +664,7 @@ add rule inet ovn-kubernetes udn-isolation ip6 daddr @udn-open-ports-icmp-v6 met
 
 	Context("nftables setup", func() {
 		It("allows kubelet to reach UDN pods when the kubelet cgroup is known", func() {
-			manager.kubeletCgroupPath = "kubelet.slice/kubelet.service"
+			manager.kubeletCgroupPaths = []string{"kubelet.slice/kubelet.service"}
 
 			Expect(manager.setupUDNIsolationFromHost()).To(Succeed())
 			Expect(nodenft.MatchNFTRules(expectedDump("kubelet.slice/kubelet.service"), fakeNFT.Dump())).To(Succeed())
@@ -672,7 +672,7 @@ add rule inet ovn-kubernetes udn-isolation ip6 daddr @udn-open-ports-icmp-v6 met
 
 		It("still isolates UDN pods when the kubelet cgroup is unknown", func() {
 			Expect(manager.setupUDNIsolationFromHost()).To(Succeed())
-			Expect(nodenft.MatchNFTRules(expectedDump(""), fakeNFT.Dump())).To(Succeed())
+			Expect(nodenft.MatchNFTRules(expectedDump(), fakeNFT.Dump())).To(Succeed())
 		})
 	})
 
@@ -698,25 +698,50 @@ add rule inet ovn-kubernetes udn-isolation ip6 daddr @udn-open-ports-icmp-v6 met
 		Entry("quote cannot end the string early", `system.slice/foo".service`, `"system.slice/foo\".service"`),
 	)
 
+	It("installs and refreshes every configured path for both IP families", func() {
+		manager.kubeletCgroupPaths = []string{"kubelet.slice/kubelet.service", "runtime/other/kubelet"}
+		Expect(manager.setupUDNIsolationFromHost()).To(Succeed())
+		Expect(nodenft.MatchNFTRules(expectedDump(manager.kubeletCgroupPaths...), fakeNFT.Dump())).To(Succeed())
+		Expect(manager.updateKubeletCgroup()).To(Succeed())
+		Expect(nodenft.MatchNFTRules(expectedDump(manager.kubeletCgroupPaths...), fakeNFT.Dump())).To(Succeed())
+	})
+
 	Context("configured kubelet cgroup path", func() {
+		It("requires every configured path to be a directory without discovery fallback", func() {
+			root := GinkgoT().TempDir()
+			Expect(os.MkdirAll(filepath.Join(root, "kubelet.service"), 0o755)).To(Succeed())
+			config.OvnKubeNode.KubeletCgroupPaths = []string{"kubelet.service", "other/kubelet"}
+			_, err := manager.kubeletCgroupPathsToUse(root)
+			Expect(err).To(MatchError(ContainSubstring("other/kubelet")))
+			Expect(os.MkdirAll(filepath.Join(root, "other"), 0o755)).To(Succeed())
+			Expect(os.WriteFile(filepath.Join(root, "other/kubelet"), nil, 0o600)).To(Succeed())
+			_, err = manager.kubeletCgroupPathsToUse(root)
+			Expect(err).To(MatchError(ContainSubstring("not a cgroup directory")))
+			Expect(os.Remove(filepath.Join(root, "other/kubelet"))).To(Succeed())
+			Expect(os.MkdirAll(filepath.Join(root, "other/kubelet"), 0o755)).To(Succeed())
+			paths, err := manager.kubeletCgroupPathsToUse(root)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(paths).To(Equal(config.OvnKubeNode.KubeletCgroupPaths))
+		})
+
 		AfterEach(func() {
-			config.OvnKubeNode.KubeletCgroupPath = ""
+			config.OvnKubeNode.KubeletCgroupPaths = nil
 		})
 
 		It("uses the configured path instead of looking one up", func() {
 			cgroupRoot := GinkgoT().TempDir()
 			Expect(os.MkdirAll(filepath.Join(cgroupRoot, "podruntime", "kubelet"), 0o755)).To(Succeed(), "create cgroup dir")
-			config.OvnKubeNode.KubeletCgroupPath = "podruntime/kubelet"
+			config.OvnKubeNode.KubeletCgroupPaths = []string{"podruntime/kubelet"}
 
-			path, err := manager.kubeletCgroupPathToUse(cgroupRoot)
+			path, err := manager.kubeletCgroupPathsToUse(cgroupRoot)
 			Expect(err).NotTo(HaveOccurred(), "configured path is used")
-			Expect(path).To(Equal("podruntime/kubelet"), "configured path is returned as given")
+			Expect(path).To(Equal([]string{"podruntime/kubelet"}), "configured path is returned as given")
 		})
 
 		It("fails when the configured path does not exist", func() {
-			config.OvnKubeNode.KubeletCgroupPath = "podruntime/kubelet"
+			config.OvnKubeNode.KubeletCgroupPaths = []string{"podruntime/kubelet"}
 
-			_, err := manager.kubeletCgroupPathToUse(GinkgoT().TempDir())
+			_, err := manager.kubeletCgroupPathsToUse(GinkgoT().TempDir())
 			Expect(err).To(MatchError(ContainSubstring("configured kubelet cgroup path")), "names the configured path")
 		})
 
@@ -724,9 +749,9 @@ add rule inet ovn-kubernetes udn-isolation ip6 daddr @udn-open-ports-icmp-v6 met
 			cgroupRoot := GinkgoT().TempDir()
 			Expect(os.MkdirAll(filepath.Join(cgroupRoot, "kubelet.slice", kubeletCgroupName), 0o755)).To(Succeed(), "create cgroup dir")
 
-			path, err := manager.kubeletCgroupPathToUse(cgroupRoot)
+			path, err := manager.kubeletCgroupPathsToUse(cgroupRoot)
 			Expect(err).NotTo(HaveOccurred(), "lookup is used")
-			Expect(path).To(Equal(filepath.Join("kubelet.slice", kubeletCgroupName)), "looked up path")
+			Expect(path).To(Equal([]string{filepath.Join("kubelet.slice", kubeletCgroupName)}), "looked up path")
 		})
 	})
 
@@ -737,19 +762,19 @@ add rule inet ovn-kubernetes udn-isolation ip6 daddr @udn-open-ports-icmp-v6 met
 			}
 		})
 		AfterEach(func() {
-			config.OvnKubeNode.KubeletCgroupPath = ""
+			config.OvnKubeNode.KubeletCgroupPaths = nil
 		})
 
 		It("still isolates UDN pods, without the kubelet rule, and reports it", func() {
 			cgroupRoot := GinkgoT().TempDir()
 			Expect(os.MkdirAll(filepath.Join(cgroupRoot, "podruntime", "kubelet"), 0o755)).To(Succeed(), "create cgroup dir")
-			config.OvnKubeNode.KubeletCgroupPath = "podruntime/kubelet"
+			config.OvnKubeNode.KubeletCgroupPaths = []string{"podruntime/kubelet"}
 			// the kernel rejects the match, as one built without CONFIG_NFT_SOCKET does.
 			manager.nft = &nftRunFailer{Interface: fakeNFT, failures: 1}
 
-			manager.setKubeletCgroupPath(cgroupRoot)
+			manager.setKubeletCgroupPaths(cgroupRoot)
 
-			Expect(manager.kubeletCgroupPath).To(BeEmpty(), "the kubelet rule is left out")
+			Expect(manager.kubeletCgroupPaths).To(BeEmpty(), "the kubelet rule is left out")
 			var event string
 			Expect(recorder.Events).To(Receive(&event), "the node is told")
 			Expect(event).To(ContainSubstring("UDNKubeletProbesNotSupported"), "event reason")
@@ -758,17 +783,30 @@ add rule inet ovn-kubernetes udn-isolation ip6 daddr @udn-open-ports-icmp-v6 met
 			// host isolation is still set up, only the kubelet rule is missing.
 			manager.nft = fakeNFT
 			Expect(manager.setupUDNIsolationFromHost()).To(Succeed())
-			Expect(nodenft.MatchNFTRules(expectedDump(""), fakeNFT.Dump())).To(Succeed(), "UDN pods stay isolated from the host")
+			Expect(nodenft.MatchNFTRules(expectedDump(), fakeNFT.Dump())).To(Succeed(), "UDN pods stay isolated from the host")
+		})
+
+		It("leaves all exemptions out when one configured path is missing", func() {
+			root := GinkgoT().TempDir()
+			Expect(os.MkdirAll(filepath.Join(root, "kubelet.service"), 0o755)).To(Succeed())
+			config.OvnKubeNode.KubeletCgroupPaths = []string{"kubelet.service", "missing/kubelet"}
+			manager.setKubeletCgroupPaths(root)
+			Expect(manager.kubeletCgroupPaths).To(BeEmpty())
+			Expect(manager.setupUDNIsolationFromHost()).To(Succeed())
+			Expect(nodenft.MatchNFTRules(expectedDump(), fakeNFT.Dump())).To(Succeed())
+			var event string
+			Expect(recorder.Events).To(Receive(&event))
+			Expect(event).To(ContainSubstring("missing/kubelet"))
 		})
 
 		It("uses the configured path when the kernel accepts the match", func() {
 			cgroupRoot := GinkgoT().TempDir()
 			Expect(os.MkdirAll(filepath.Join(cgroupRoot, "podruntime", "kubelet"), 0o755)).To(Succeed(), "create cgroup dir")
-			config.OvnKubeNode.KubeletCgroupPath = "podruntime/kubelet"
+			config.OvnKubeNode.KubeletCgroupPaths = []string{"podruntime/kubelet"}
 
-			manager.setKubeletCgroupPath(cgroupRoot)
+			manager.setKubeletCgroupPaths(cgroupRoot)
 
-			Expect(manager.kubeletCgroupPath).To(Equal("podruntime/kubelet"), "the configured path is used")
+			Expect(manager.kubeletCgroupPaths).To(Equal([]string{"podruntime/kubelet"}), "the configured path is used")
 			Expect(recorder.Events).NotTo(Receive(), "nothing is reported")
 			Expect(manager.setupUDNIsolationFromHost()).To(Succeed())
 			Expect(nodenft.MatchNFTRules(expectedDump("podruntime/kubelet"), fakeNFT.Dump())).To(Succeed(), "kubelet rule is installed")
@@ -853,10 +891,10 @@ add rule inet ovn-kubernetes udn-isolation ip6 daddr @udn-open-ports-icmp-v6 met
 		const reresolvedPath = "kubelet.slice/kubelet-1234.service"
 
 		BeforeEach(func() {
-			manager.kubeletCgroupPath = originalPath
+			manager.kubeletCgroupPaths = []string{originalPath}
 			Expect(manager.setupUDNIsolationFromHost()).To(Succeed())
 			Expect(nodenft.MatchNFTRules(expectedDump(originalPath), fakeNFT.Dump())).To(Succeed(), "rules start on the original path")
-			manager.kubeletCgroupPath = reresolvedPath
+			manager.kubeletCgroupPaths = []string{reresolvedPath}
 		})
 
 		It("re-applies the rules when the kubelet unit becomes active", func() {
@@ -864,6 +902,13 @@ add rule inet ovn-kubernetes udn-isolation ip6 daddr @udn-open-ports-icmp-v6 met
 
 			manager.handleKubeletRestartSignal(signal, kubeletUnit)
 			Expect(nodenft.MatchNFTRules(expectedDump(reresolvedPath), fakeNFT.Dump())).To(Succeed(), "rules are rebuilt for the re-resolved path")
+		})
+
+		It("refreshes all paths when a second configured unit restarts", func() {
+			manager.kubeletCgroupPaths = []string{reresolvedPath, "system.slice/other.service"}
+			signal := propertiesChanged("/org/freedesktop/systemd1/unit/other_2eservice", activeState("active")...)
+			manager.handleKubeletRestartSignal(signal, kubeletUnit, "other.service")
+			Expect(nodenft.MatchNFTRules(expectedDump(manager.kubeletCgroupPaths...), fakeNFT.Dump())).To(Succeed())
 		})
 
 		It("re-applies the rules for a renamed unit", func() {
@@ -902,9 +947,9 @@ add rule inet ovn-kubernetes udn-isolation ip6 daddr @udn-open-ports-icmp-v6 met
 		cgroupRoot := GinkgoT().TempDir()
 		Expect(os.MkdirAll(filepath.Join(cgroupRoot, "kubelet.slice", kubeletCgroupName), 0o755)).To(Succeed(), "create cgroup dir")
 
-		manager.setKubeletCgroupPath(cgroupRoot)
+		manager.setKubeletCgroupPaths(cgroupRoot)
 
-		Expect(manager.kubeletCgroupPath).To(BeEmpty(), "the kubelet rule is left out even though kubelet's cgroup exists")
+		Expect(manager.kubeletCgroupPaths).To(BeEmpty(), "the kubelet rule is left out even though kubelet's cgroup exists")
 		var event string
 		Expect(recorder.Events).To(Receive(&event), "the node is told")
 		Expect(event).To(ContainSubstring("UDNKubeletProbesNotSupported"), "event reason")
@@ -912,7 +957,7 @@ add rule inet ovn-kubernetes udn-isolation ip6 daddr @udn-open-ports-icmp-v6 met
 
 		// host isolation is still set up, only the kubelet rule is missing.
 		Expect(manager.setupUDNIsolationFromHost()).To(Succeed())
-		Expect(nodenft.MatchNFTRules(expectedDump(""), fakeNFT.Dump())).To(Succeed(), "UDN pods stay isolated from the host")
+		Expect(nodenft.MatchNFTRules(expectedDump(), fakeNFT.Dump())).To(Succeed(), "UDN pods stay isolated from the host")
 	})
 
 	It("reports unsupported kubelet probes on the node", func() {
