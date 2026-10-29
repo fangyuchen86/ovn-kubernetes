@@ -2266,7 +2266,26 @@ udn-allowed-default-services= ns/svc, ns1/svc1
 var _ = Describe("completeOvnKubeNodeConfig", func() {
 	AfterEach(func() {
 		OvnKubeNode.KubeletCgroupPath = ""
+		OvnKubeNode.RawKubeletCgroupPaths = ""
+		OvnKubeNode.KubeletCgroupPaths = nil
 	})
+
+	It("normalizes and deduplicates multiple paths in order, overriding the legacy option", func() {
+		OvnKubeNode.KubeletCgroupPath = "legacy/kubelet"
+		OvnKubeNode.RawKubeletCgroupPaths = " /runtime//kubelet/,system.slice/kubelet.service,runtime/kubelet "
+		gomega.Expect(completeOvnKubeNodeConfig()).To(gomega.Succeed())
+		gomega.Expect(OvnKubeNode.KubeletCgroupPaths).To(gomega.Equal([]string{"runtime/kubelet", "system.slice/kubelet.service"}))
+	})
+
+	DescribeTable("rejects invalid entries in a path list", func(raw string) {
+		OvnKubeNode.RawKubeletCgroupPaths = raw
+		gomega.Expect(completeOvnKubeNodeConfig()).NotTo(gomega.Succeed())
+	},
+		Entry("root", "valid/kubelet,/"),
+		Entry("traversal", "valid/kubelet,foo/../bar"),
+		Entry("empty", "valid/kubelet,"),
+		Entry("whitespace", "valid/kubelet,  "),
+	)
 
 	DescribeTable("normalizes the kubelet cgroup path",
 		func(configured, expected string) {
@@ -2312,6 +2331,29 @@ var _ = Describe("kubelet cgroup path config", func() {
 		app.Name = "test"
 		app.Flags = Flags
 	})
+
+	DescribeTable("reads multiple paths with command-line precedence", func(cliValue string, expected []string) {
+		cfgFile, err := os.CreateTemp("", "config-*.conf")
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		defer os.Remove(cfgFile.Name())
+		_, err = cfgFile.WriteString("[ovnkubenode]\nkubelet-cgroup-paths=/from-file/kubelet,other/kubelet\n")
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(cfgFile.Close()).To(gomega.Succeed())
+		app.Action = func(ctx *cli.Context) error {
+			_, err := InitConfig(ctx, kexec.New(), nil)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Expect(OvnKubeNode.KubeletCgroupPaths).To(gomega.Equal(expected))
+			return nil
+		}
+		args := []string{app.Name, "--config-file=" + cfgFile.Name()}
+		if cliValue != "" {
+			args = append(args, "--kubelet-cgroup-paths="+cliValue)
+		}
+		gomega.Expect(app.Run(args)).To(gomega.Succeed())
+	},
+		Entry("config file", "", []string{"from-file/kubelet", "other/kubelet"}),
+		Entry("CLI overrides file", "cli/kubelet,cli/other", []string{"cli/kubelet", "cli/other"}),
+	)
 
 	It("is read from the config file", func() {
 		cfgFile, err := os.CreateTemp("", "config-*.conf")

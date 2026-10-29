@@ -726,6 +726,11 @@ type OvnKubeNodeConfig struct {
 	// KubeletCgroupPath is the cgroup v2 path kubelet runs under, relative to
 	// /sys/fs/cgroup. When empty, the kubelet.service cgroup is looked up instead.
 	KubeletCgroupPath string `gcfg:"kubelet-cgroup-path"`
+	// RawKubeletCgroupPaths is the comma-separated list from configuration.
+	RawKubeletCgroupPaths string `gcfg:"kubelet-cgroup-paths"`
+	// KubeletCgroupPaths contains normalized, unique paths for UDN host isolation.
+	// When configured, the plural option takes precedence over KubeletCgroupPath.
+	KubeletCgroupPaths []string
 }
 
 // ClusterManagerConfig holds configuration for ovnkube-cluster-manager
@@ -1894,6 +1899,13 @@ var OvnKubeNodeFlags = []cli.Flag{
 			"and used to allow host network services and pods to access k8s pod and service networks. ",
 		Value:       OvnKubeNode.MgmtPortDPResourceName,
 		Destination: &cliConfig.OvnKubeNode.MgmtPortDPResourceName,
+	},
+	&cli.StringFlag{
+		Name: "kubelet-cgroup-paths",
+		Usage: "Comma-separated cgroup v2 paths relative to /sys/fs/cgroup. UDN host isolation allows " +
+			"every process in these cgroups to reach primary UDN pods. Takes precedence over kubelet-cgroup-path. " +
+			"Only used when enable-network-segmentation is set",
+		Destination: &cliConfig.OvnKubeNode.RawKubeletCgroupPaths,
 	},
 	&cli.StringFlag{
 		Name: "kubelet-cgroup-path",
@@ -3079,25 +3091,37 @@ func initConfigWithPath(ctx *cli.Context, exec kexec.Interface, saPath string, d
 
 // completeOvnKubeNodeConfig normalizes and validates the ovnkube-node configuration.
 func completeOvnKubeNodeConfig() error {
-	if OvnKubeNode.KubeletCgroupPath == "" {
-		return nil
+	OvnKubeNode.KubeletCgroupPaths = nil
+	var configured []string
+	if OvnKubeNode.RawKubeletCgroupPaths != "" {
+		configured = strings.Split(OvnKubeNode.RawKubeletCgroupPaths, ",")
+	} else if OvnKubeNode.KubeletCgroupPath != "" {
+		configured = []string{OvnKubeNode.KubeletCgroupPath}
 	}
-	// cgroup paths are slash separated whatever the host, so they are not file paths.
-	// ".." is rejected before cleaning, which would resolve it away.
-	for _, element := range strings.Split(OvnKubeNode.KubeletCgroupPath, "/") {
-		if element == ".." {
-			return fmt.Errorf("kubelet cgroup path %q must not contain %q elements",
-				OvnKubeNode.KubeletCgroupPath, "..")
+	seen := sets.New[string]()
+	for _, raw := range configured {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			return fmt.Errorf("kubelet cgroup paths must not contain empty entries")
+		}
+		// Reject traversal before cleaning can resolve it away.
+		for _, element := range strings.Split(raw, "/") {
+			if element == ".." {
+				return fmt.Errorf("kubelet cgroup path %q must not contain %q elements", raw, "..")
+			}
+		}
+		cgroupPath := strings.TrimPrefix(path.Clean("/"+raw), "/")
+		if cgroupPath == "" {
+			return fmt.Errorf("kubelet cgroup path %q must not be the cgroup root", raw)
+		}
+		if !seen.Has(cgroupPath) {
+			seen.Insert(cgroupPath)
+			OvnKubeNode.KubeletCgroupPaths = append(OvnKubeNode.KubeletCgroupPaths, cgroupPath)
 		}
 	}
-	cgroupPath := strings.TrimPrefix(path.Clean("/"+OvnKubeNode.KubeletCgroupPath), "/")
-	if cgroupPath == "" {
-		// the cgroup root holds every process on the host, so matching on it would
-		// let all of them reach primary UDN pods.
-		return fmt.Errorf("kubelet cgroup path %q must not be the cgroup root",
-			OvnKubeNode.KubeletCgroupPath)
+	if OvnKubeNode.RawKubeletCgroupPaths == "" && len(OvnKubeNode.KubeletCgroupPaths) > 0 {
+		OvnKubeNode.KubeletCgroupPath = OvnKubeNode.KubeletCgroupPaths[0]
 	}
-	OvnKubeNode.KubeletCgroupPath = cgroupPath
 	return nil
 }
 

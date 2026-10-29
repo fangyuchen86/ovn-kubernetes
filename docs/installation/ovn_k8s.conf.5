@@ -142,6 +142,16 @@ requires kubelet to be managed by systemd. When neither is available, kubelet
 probes to primary UDN pods are not allowed and the node reports a
 UDNKubeletProbesNotSupported event.
 
+.TP
+\fBkubelet-cgroup-paths\fR=
+Optional comma-separated list of cgroup v2 paths relative to /sys/fs/cgroup.
+A non-empty list overrides kubelet-cgroup-path. Each path allows its processes
+to reach primary UDN pods for both enabled IP families. Paths are normalized and
+deduplicated. Empty entries, the cgroup root and ".." components are rejected.
+All paths must exist and support the socket match; otherwise host isolation is
+installed without kubelet exemptions. Restart tracking follows each systemd unit;
+non-systemd paths cannot be refreshed automatically on restart.
+
 .SH [Gateway]
 .TP
 \fBmode\fR=shared
