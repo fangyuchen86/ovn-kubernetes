@@ -717,7 +717,49 @@ add rule inet ovn-kubernetes udn-isolation ip6 daddr @udn-open-ports-icmp-v6 met
 			config.OvnKubeNode.KubeletCgroupPath = "podruntime/kubelet"
 
 			_, err := manager.kubeletCgroupPathToUse(GinkgoT().TempDir())
-			Expect(err).To(MatchError(ContainSubstring("configured kubelet cgroup path")), "names the configured path")
+			Expect(err).To(MatchError(ContainSubstring(`kubelet cgroup path "podruntime/kubelet"`)), "names the configured path")
+		})
+
+		DescribeTable("selects the first usable candidate",
+			func(configured string, failures int, expected string) {
+				cgroupRoot := GinkgoT().TempDir()
+				for _, path := range []string{"custom/first", "other.slice/worker.scope"} {
+					Expect(os.MkdirAll(filepath.Join(cgroupRoot, path), 0o755)).To(Succeed())
+				}
+				Expect(os.WriteFile(filepath.Join(cgroupRoot, "not-a-directory"), nil, 0o600)).To(Succeed())
+				config.OvnKubeNode.KubeletCgroupPath = configured
+				manager.nft = &nftRunFailer{Interface: fakeNFT, failures: failures}
+
+				path, err := manager.kubeletCgroupPathToUse(cgroupRoot)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(path).To(Equal(expected))
+				Expect(fakeNFT.Dump()).NotTo(ContainSubstring(socketMatchProbeChain))
+				Expect(recorder.Events).NotTo(Receive())
+
+				manager.kubeletCgroupPath = path
+				Expect(manager.setupUDNIsolationFromHost()).To(Succeed())
+				Expect(nodenft.MatchNFTRules(expectedDump(expected), fakeNFT.Dump())).To(Succeed())
+			},
+			Entry("skips missing paths and regular files", "missing,not-a-directory,other.slice/worker.scope", 0, "other.slice/worker.scope"),
+			Entry("preserves configured order", "other.slice/worker.scope,custom/first", 0, "other.slice/worker.scope"),
+			Entry("skips a rejected nftables match", "custom/first,other.slice/worker.scope", 1, "other.slice/worker.scope"),
+		)
+
+		It("reports every failed candidate without falling back to discovery", func() {
+			cgroupRoot := GinkgoT().TempDir()
+			Expect(os.MkdirAll(filepath.Join(cgroupRoot, "system.slice", kubeletCgroupName), 0o755)).To(Succeed())
+			Expect(os.MkdirAll(filepath.Join(cgroupRoot, "custom/first"), 0o755)).To(Succeed())
+			Expect(os.WriteFile(filepath.Join(cgroupRoot, "not-a-directory"), nil, 0o600)).To(Succeed())
+			config.OvnKubeNode.KubeletCgroupPath = "missing,not-a-directory,custom/first"
+			manager.nft = &nftRunFailer{Interface: fakeNFT, failures: 1}
+
+			path, err := manager.kubeletCgroupPathToUse(cgroupRoot)
+			Expect(path).To(BeEmpty())
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring(`"missing"`))
+			Expect(err.Error()).To(ContainSubstring(`"not-a-directory"`))
+			Expect(err.Error()).To(ContainSubstring(`"custom/first"`))
+			Expect(err.Error()).To(ContainSubstring("socket cgroupv2 match"))
 		})
 
 		It("looks the path up when none is configured", func() {
@@ -743,7 +785,7 @@ add rule inet ovn-kubernetes udn-isolation ip6 daddr @udn-open-ports-icmp-v6 met
 		It("still isolates UDN pods, without the kubelet rule, and reports it", func() {
 			cgroupRoot := GinkgoT().TempDir()
 			Expect(os.MkdirAll(filepath.Join(cgroupRoot, "podruntime", "kubelet"), 0o755)).To(Succeed(), "create cgroup dir")
-			config.OvnKubeNode.KubeletCgroupPath = "podruntime/kubelet"
+			config.OvnKubeNode.KubeletCgroupPath = "missing,podruntime/kubelet"
 			// the kernel rejects the match, as one built without CONFIG_NFT_SOCKET does.
 			manager.nft = &nftRunFailer{Interface: fakeNFT, failures: 1}
 
@@ -764,7 +806,7 @@ add rule inet ovn-kubernetes udn-isolation ip6 daddr @udn-open-ports-icmp-v6 met
 		It("uses the configured path when the kernel accepts the match", func() {
 			cgroupRoot := GinkgoT().TempDir()
 			Expect(os.MkdirAll(filepath.Join(cgroupRoot, "podruntime", "kubelet"), 0o755)).To(Succeed(), "create cgroup dir")
-			config.OvnKubeNode.KubeletCgroupPath = "podruntime/kubelet"
+			config.OvnKubeNode.KubeletCgroupPath = "missing,podruntime/kubelet"
 
 			manager.setKubeletCgroupPath(cgroupRoot)
 
