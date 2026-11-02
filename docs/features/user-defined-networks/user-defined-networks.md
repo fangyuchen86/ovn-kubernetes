@@ -661,6 +661,40 @@ which on that host means:
 kubelet-cgroup-path = podruntime/kubelet
 ```
 
+For nodes with different cgroup layouts, configure an ordered, comma-separated
+list of candidate paths. Paths can have arbitrary names and depths; they do not
+need to end in `kubelet.service`:
+
+```ini
+[ovnkubenode]
+kubelet-cgroup-path = system.slice/kubelet.service,podruntime/kubelet,custom.slice/worker.scope
+```
+
+The same list can be passed with `--kubelet-cgroup-path` or through Helm:
+
+```yaml
+global:
+  kubeletCgroupPath: "system.slice/kubelet.service,podruntime/kubelet,custom.slice/worker.scope"
+```
+
+At startup, ovnkube-node tries candidates in order and uses the first existing
+directory whose nftables `socket cgroupv2` match can be installed. Missing paths,
+non-directory paths, and rejected matches do not prevent later candidates from
+being tried. Only the selected path is allowed to reach primary UDN pods. The
+check verifies that the rule can be installed; it does not verify which process
+runs in that cgroup. Put the intended kubelet cgroup first when several candidates
+exist on the same node.
+
+If all candidates fail, the node reports `UDNKubeletProbesNotSupported` with the
+failure reasons and keeps host isolation without the kubelet exception. Automatic
+`kubelet.service` discovery is used only when the setting is unset. Candidate
+selection happens at startup; changes to the list or switching candidates require
+restarting ovnkube-node.
+
+Whitespace around each entry and leading/trailing slashes are normalized. Empty
+entries, the cgroup root, and any `..` path component are rejected in every
+candidate. Commas separate candidates and cannot be part of a path name.
+
 Point this at the cgroup of kubelet itself. Every process in the cgroup
 that is matched is allowed to reach primary UDN pods, so a parent cgroup
 opens that access to everything under it. On the host above, using

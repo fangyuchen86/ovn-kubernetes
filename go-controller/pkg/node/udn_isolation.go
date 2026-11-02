@@ -157,25 +157,36 @@ func (m *UDNHostIsolationManager) socketCgroupv2MatchSupported(cgroupPath string
 	return m.nft.Run(context.TODO(), tx)
 }
 
-// kubeletCgroupPathToUse returns the cgroup path to match kubelet traffic on, relative
-// to the cgroup root. A configured path is used as given, which is the only option on
-// hosts that do not run kubelet under systemd. Otherwise the kubelet.service cgroup is
-// looked up, which keeps hosts that do work without configuration.
+// kubeletCgroupPathToUse returns the first candidate whose socket cgroupv2 match
+// can be installed. Explicit candidates are tried in order without requiring
+// systemd. Only an unset configuration triggers kubelet.service discovery.
 func (m *UDNHostIsolationManager) kubeletCgroupPathToUse(cgroupRoot string) (string, error) {
-	if configured := config.OvnKubeNode.KubeletCgroupPath; configured != "" {
-		info, err := os.Stat(filepath.Join(cgroupRoot, configured))
+	paths := strings.Split(config.OvnKubeNode.KubeletCgroupPath, ",")
+	if config.OvnKubeNode.KubeletCgroupPath == "" {
+		path, err := findKubeletCgroupPath(cgroupRoot)
 		if err != nil {
-			return "", fmt.Errorf("configured kubelet cgroup path %q is not present under %s: %w",
-				configured, cgroupRoot, err)
+			return "", err
+		}
+		paths = []string{path}
+	}
+	var errs []error
+	for _, candidate := range paths {
+		info, err := os.Stat(filepath.Join(cgroupRoot, candidate))
+		if err != nil {
+			errs = append(errs, fmt.Errorf("kubelet cgroup path %q is not present under %s: %w", candidate, cgroupRoot, err))
+			continue
 		}
 		if !info.IsDir() {
-			return "", fmt.Errorf("configured kubelet cgroup path %q under %s is not a cgroup directory",
-				configured, cgroupRoot)
+			errs = append(errs, fmt.Errorf("kubelet cgroup path %q under %s is not a cgroup directory", candidate, cgroupRoot))
+			continue
 		}
-		klog.Infof("Using configured kubelet cgroup path: %s", configured)
-		return configured, nil
+		if err := m.socketCgroupv2MatchSupported(candidate); err != nil {
+			errs = append(errs, fmt.Errorf("kubelet cgroup path %q cannot install the nftables socket cgroupv2 match: %w", candidate, err))
+			continue
+		}
+		return candidate, nil
 	}
-	return findKubeletCgroupPath(cgroupRoot)
+	return "", fmt.Errorf("no usable kubelet cgroup path: %w", errors.Join(errs...))
 }
 
 // setKubeletCgroupPath stores the cgroup kubelet runs under in m.kubeletCgroupPath.
@@ -200,10 +211,6 @@ func (m *UDNHostIsolationManager) setKubeletCgroupPath(cgroupRoot string) {
 	path, err := m.kubeletCgroupPathToUse(cgroupRoot)
 	if err != nil {
 		m.reportKubeletProbesUnsupported(err.Error())
-		return
-	}
-	if err := m.socketCgroupv2MatchSupported(path); err != nil {
-		m.reportKubeletProbesUnsupported(fmt.Sprintf("the kernel does not support the nftables socket cgroupv2 match: %v", err))
 		return
 	}
 	klog.Infof("Found kubelet cgroup path: %s", path)

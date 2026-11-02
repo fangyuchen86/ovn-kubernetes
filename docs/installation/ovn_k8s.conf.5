@@ -129,16 +129,24 @@ EgressIP assignments, and allow ovnkube-node to clean up their VRFs and route
 tables before changing this value.
 .TP
 \fBkubelet-cgroup-path\fR=
-Optional cgroup v2 path kubelet runs under, relative to /sys/fs/cgroup, for
-example "kubelet.slice/kubelet.service". UDN host isolation uses it to allow
+Optional comma-separated candidate cgroup v2 paths kubelet runs under, relative
+to /sys/fs/cgroup, for example "kubelet.slice/kubelet.service,podruntime/kubelet".
+UDN host isolation uses the first usable path to allow
 kubelet probes to primary UDN pods. Only used when network segmentation is
 enabled.
+Candidates are tried in order at startup. Missing paths, non-directory paths,
+and paths whose nftables socket cgroupv2 match cannot be installed are skipped.
+Only the first usable path is matched; rule installation does not verify that
+kubelet runs there. Changing candidates requires restarting ovnkube-node.
+Whitespace around entries is trimmed. Empty entries are rejected, and commas
+cannot be part of a path name. A single path remains supported.
 Every process in this cgroup is allowed to reach primary UDN pods, so it should
 be the cgroup of kubelet itself rather than a parent cgroup it shares with other
 workloads. The cgroup root is rejected, as is any path containing a ".."
 component, so give the cgroup path directly rather than relative to another.
 If unset, the kubelet.service cgroup is looked up under /sys/fs/cgroup, which
-requires kubelet to be managed by systemd. When neither is available, kubelet
+requires kubelet to be managed by systemd. Explicit candidates do not fall back
+to automatic discovery. When no usable path is available, kubelet
 probes to primary UDN pods are not allowed and the node reports a
 UDNKubeletProbesNotSupported event.
 
