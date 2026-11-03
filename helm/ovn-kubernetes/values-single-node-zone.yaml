@@ -19,6 +19,8 @@ mtu: 1400
 skipCallToK8s: false
 
 global:
+  # -- Cgroup v2 paths relative to /sys/fs/cgroup allowed to probe primary UDN pods. Overrides kubeletCgroupPath; empty uses the legacy option or automatic discovery.
+  kubeletCgroupPaths: []
   # -- The interface on nodes that will be used for external gateway network traffic
   extGatewayNetworkInterface: ""
   # -- GENEVE UDP port (default 6081)

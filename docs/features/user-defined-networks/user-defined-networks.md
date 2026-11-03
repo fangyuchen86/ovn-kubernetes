@@ -661,6 +661,36 @@ which on that host means:
 kubelet-cgroup-path = podruntime/kubelet
 ```
 
+To allow more than one cgroup, use `kubelet-cgroup-paths` (or the
+`--kubelet-cgroup-paths` command-line option) with a comma-separated list:
+
+```ini
+[ovnkubenode]
+kubelet-cgroup-paths = kubelet.slice/kubelet.service,podruntime/kubelet
+```
+
+With Helm, use a list:
+
+```yaml
+global:
+  kubeletCgroupPaths:
+    - kubelet.slice/kubelet.service
+    - podruntime/kubelet
+```
+
+A non-empty plural option takes precedence over the legacy single-path option.
+The command-line plural option overrides the configuration-file plural option.
+An empty Helm list keeps the legacy option or automatic discovery. Paths are
+relative to `/sys/fs/cgroup`; leading/trailing slashes and repeated separators
+are normalized, surrounding whitespace is trimmed, and duplicates are removed.
+Empty list entries, the cgroup root, and `..` components are rejected.
+Each path gets its own IPv4/IPv6 rule. All configured paths must exist and support
+the socket cgroup match; otherwise no kubelet exemptions are installed and host
+isolation remains active. There is no automatic-discovery fallback for invalid
+configured paths. Restart tracking follows each configured systemd unit and
+refreshes all matches. Non-systemd paths retain the restart limitations described
+below, even when other configured paths belong to systemd units.
+
 Point this at the cgroup of kubelet itself. Every process in the cgroup
 that is matched is allowed to reach primary UDN pods, so a parent cgroup
 opens that access to everything under it. On the host above, using

@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -59,13 +60,13 @@ const (
 // It uses nftables chain "udn-isolation" to only allow connection to primary UDN pods from kubelet.
 // It also listens to systemd events to re-apply the rules after kubelet restart as cgroup matching is used.
 type UDNHostIsolationManager struct {
-	nft               knftables.Interface
-	ipv4, ipv6        bool
-	podController     controller.Controller
-	podLister         corelisters.PodLister
-	kubeletCgroupPath string
-	nodeName          string
-	recorder          record.EventRecorder
+	nft                knftables.Interface
+	ipv4, ipv6         bool
+	podController      controller.Controller
+	podLister          corelisters.PodLister
+	kubeletCgroupPaths []string
+	nodeName           string
+	recorder           record.EventRecorder
 
 	udnPodIPsv4 *nftPodElementsSet
 	udnPodIPsv6 *nftPodElementsSet
@@ -157,38 +158,35 @@ func (m *UDNHostIsolationManager) socketCgroupv2MatchSupported(cgroupPath string
 	return m.nft.Run(context.TODO(), tx)
 }
 
-// kubeletCgroupPathToUse returns the cgroup path to match kubelet traffic on, relative
-// to the cgroup root. A configured path is used as given, which is the only option on
-// hosts that do not run kubelet under systemd. Otherwise the kubelet.service cgroup is
-// looked up, which keeps hosts that do work without configuration.
-func (m *UDNHostIsolationManager) kubeletCgroupPathToUse(cgroupRoot string) (string, error) {
-	if configured := config.OvnKubeNode.KubeletCgroupPath; configured != "" {
-		info, err := os.Stat(filepath.Join(cgroupRoot, configured))
+// kubeletCgroupPathsToUse validates configured paths, or discovers kubelet's cgroup
+// when no override was supplied. A missing configured path never falls back to discovery.
+func (m *UDNHostIsolationManager) kubeletCgroupPathsToUse(cgroupRoot string) ([]string, error) {
+	configured := config.OvnKubeNode.KubeletCgroupPaths
+	if len(configured) == 0 {
+		path, err := findKubeletCgroupPath(cgroupRoot)
 		if err != nil {
-			return "", fmt.Errorf("configured kubelet cgroup path %q is not present under %s: %w",
-				configured, cgroupRoot, err)
+			return nil, err
+		}
+		return []string{path}, nil
+	}
+	for _, path := range configured {
+		info, err := os.Stat(filepath.Join(cgroupRoot, path))
+		if err != nil {
+			return nil, fmt.Errorf("configured kubelet cgroup path %q is not present under %s: %w", path, cgroupRoot, err)
 		}
 		if !info.IsDir() {
-			return "", fmt.Errorf("configured kubelet cgroup path %q under %s is not a cgroup directory",
-				configured, cgroupRoot)
+			return nil, fmt.Errorf("configured kubelet cgroup path %q under %s is not a cgroup directory", path, cgroupRoot)
 		}
-		klog.Infof("Using configured kubelet cgroup path: %s", configured)
-		return configured, nil
 	}
-	return findKubeletCgroupPath(cgroupRoot)
+	return configured, nil
 }
 
-// setKubeletCgroupPath stores the cgroup kubelet runs under in m.kubeletCgroupPath.
-// When it cannot be resolved, or the match cannot be loaded from this container,
-// kubelet probes to primary UDN pods are reported as unsupported and the path is left
-// empty, which leaves the kubelet rule out of the isolation chain. Host isolation
-// itself is unaffected.
-func (m *UDNHostIsolationManager) setKubeletCgroupPath(cgroupRoot string) {
+// setKubeletCgroupPaths enables the configured matches only if every path can be
+// resolved and loaded. Otherwise host isolation remains active without exemptions.
+func (m *UDNHostIsolationManager) setKubeletCgroupPaths(cgroupRoot string) {
 	if config.UnprivilegedMode {
-		// The kernel reads the level of the socket cgroupv2 match relative to the
-		// cgroup namespace of the process that loads the rule. An unprivileged
-		// container runs in its own cgroup namespace, so a rule it loads can never
-		// match kubelet's cgroup, whatever is mounted at the cgroup root.
+		// The kernel resolves the socket match level in the loader's cgroup
+		// namespace, so a private namespace cannot match host kubelet cgroups.
 		m.reportKubeletProbesUnsupported("ovnkube-node runs in unprivileged mode, in its own cgroup namespace, " +
 			"and the nftables socket cgroupv2 match can only be loaded from the host cgroup namespace")
 		return
@@ -197,18 +195,20 @@ func (m *UDNHostIsolationManager) setKubeletCgroupPath(cgroupRoot string) {
 		m.reportKubeletProbesUnsupported("the node uses cgroup v1")
 		return
 	}
-	path, err := m.kubeletCgroupPathToUse(cgroupRoot)
+	paths, err := m.kubeletCgroupPathsToUse(cgroupRoot)
 	if err != nil {
 		m.reportKubeletProbesUnsupported(err.Error())
 		return
 	}
-	if err := m.socketCgroupv2MatchSupported(path); err != nil {
-		m.reportKubeletProbesUnsupported(fmt.Sprintf("the kernel does not support the nftables socket cgroupv2 match: %v", err))
-		return
+	for _, path := range paths {
+		if err := m.socketCgroupv2MatchSupported(path); err != nil {
+			m.reportKubeletProbesUnsupported(fmt.Sprintf("the kernel does not support the nftables socket cgroupv2 match for %q: %v", path, err))
+			return
+		}
 	}
-	klog.Infof("Found kubelet cgroup path: %s", path)
-	klog.Warningf("Every process in cgroup %s is allowed to reach primary UDN pods", path)
-	m.kubeletCgroupPath = path
+	klog.Infof("Found kubelet cgroup paths: %v", paths)
+	klog.Warningf("Every process in cgroups %v is allowed to reach primary UDN pods", paths)
+	m.kubeletCgroupPaths = paths
 }
 
 // reportKubeletProbesUnsupported logs and reports on the node that kubelet probes to
@@ -240,14 +240,14 @@ func (m *UDNHostIsolationManager) Start(ctx context.Context) error {
 
 	// A failure to resolve the kubelet cgroup is not fatal: host isolation is still set
 	// up, only the rule that lets kubelet reach primary UDN pods is left out.
-	m.setKubeletCgroupPath(unifiedMountpoint)
+	m.setKubeletCgroupPaths(unifiedMountpoint)
 
 	if err = m.setupUDNIsolationFromHost(); err != nil {
 		return fmt.Errorf("failed to setup UDN host isolation: %w", err)
 	}
 	// The tracker only exists to re-resolve the kubelet cgroup match, so it is pointless
 	// without one.
-	if m.kubeletCgroupPath != "" {
+	if len(m.kubeletCgroupPaths) > 0 {
 		err = m.runKubeletRestartTracker(ctx)
 		switch {
 		case errors.Is(err, errNoSystemdUnit):
@@ -398,11 +398,11 @@ func (m *UDNHostIsolationManager) addRules(tx *knftables.Transaction) {
 			),
 		})
 
-		if m.kubeletCgroupPath != "" {
+		for _, path := range m.kubeletCgroupPaths {
 			tx.Add(&knftables.Rule{
 				Chain: UDNIsolationChain,
 				Rule: knftables.Concat(
-					kubeletCgroupMatch(m.kubeletCgroupPath),
+					kubeletCgroupMatch(path),
 					"ip", "daddr", "@", nftablesUDNPodIPsv4, "accept"),
 			})
 		}
@@ -428,11 +428,11 @@ func (m *UDNHostIsolationManager) addRules(tx *knftables.Transaction) {
 				"accept",
 			),
 		})
-		if m.kubeletCgroupPath != "" {
+		for _, path := range m.kubeletCgroupPaths {
 			tx.Add(&knftables.Rule{
 				Chain: UDNIsolationChain,
 				Rule: knftables.Concat(
-					kubeletCgroupMatch(m.kubeletCgroupPath),
+					kubeletCgroupMatch(path),
 					"ip6", "daddr", "@", nftablesUDNPodIPsv6, "accept"),
 			})
 		}
@@ -504,12 +504,12 @@ func decodeSystemdUnitName(escapedUnit string) string {
 // kubelet unit becoming active again. The systemd private connection delivers every
 // signal rather than a filtered subset, so each field is checked before use: an
 // unexpected shape would otherwise panic the tracker goroutine.
-func (m *UDNHostIsolationManager) handleKubeletRestartSignal(signal *dbus.Signal, kubeletUnit string) {
+func (m *UDNHostIsolationManager) handleKubeletRestartSignal(signal *dbus.Signal, kubeletUnits ...string) {
 	parts := strings.Split(string(signal.Path), "/")
 	if len(parts) < 6 || parts[4] != "unit" {
 		return
 	}
-	if decodeSystemdUnitName(parts[5]) != kubeletUnit || len(signal.Body) < 2 {
+	if !slices.Contains(kubeletUnits, decodeSystemdUnitName(parts[5])) || len(signal.Body) < 2 {
 		return
 	}
 	changes, ok := signal.Body[1].(map[string]dbus.Variant)
@@ -538,11 +538,20 @@ func (m *UDNHostIsolationManager) handleKubeletRestartSignal(signal *dbus.Signal
 // If a new cgroup is created, you load the filtering policy for the new cgroup and then add
 // processes to that cgroup. You only have to follow the right sequence to avoid problems.
 func (m *UDNHostIsolationManager) runKubeletRestartTracker(ctx context.Context) (err error) {
-	// the tracker follows a systemd unit, so it can only be used when the kubelet
-	// cgroup belongs to one.
-	kubeletUnit, err := kubeletSystemdUnit(m.kubeletCgroupPath)
-	if err != nil {
-		return err
+	// Track all systemd units, even when some configured paths are not units.
+	units := sets.New[string]()
+	for _, path := range m.kubeletCgroupPaths {
+		unit, unitErr := kubeletSystemdUnit(path)
+		if unitErr != nil {
+			message := fmt.Sprintf("Kubelet restarts are not tracked for cgroup %q on node %s: %v", path, m.nodeName, unitErr)
+			klog.Warning(message)
+			m.recordNodeWarning("UDNKubeletRestartTrackingUnavailable", message)
+			continue
+		}
+		units.Insert(unit)
+	}
+	if len(units) == 0 {
+		return errNoSystemdUnit
 	}
 
 	conn, err := dbus.Dial("unix:path=/run/systemd/private", dbus.WithContext(ctx))
@@ -586,7 +595,7 @@ func (m *UDNHostIsolationManager) runKubeletRestartTracker(ctx context.Context) 
 					return
 				}
 				klog.V(5).Infof("D-Bus event received: %#v", signal)
-				m.handleKubeletRestartSignal(signal, kubeletUnit)
+				m.handleKubeletRestartSignal(signal, units.UnsortedList()...)
 			}
 		}
 	}()

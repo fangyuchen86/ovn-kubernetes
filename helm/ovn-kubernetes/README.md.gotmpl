@@ -18,3 +18,21 @@ For installation instructions, see:
 
 The rest of this README documents the chart values.
 {{ template "chart.valuesSectionHtml" . }}
+
+### Multiple kubelet cgroups
+
+Set `global.kubeletCgroupPaths` to a list of cgroup v2 paths relative to
+`/sys/fs/cgroup`, for example:
+
+```yaml
+global:
+  kubeletCgroupPaths:
+    - kubelet.slice/kubelet.service
+    - podruntime/kubelet
+```
+
+A non-empty list overrides `global.kubeletCgroupPath`; an empty list preserves
+single-path configuration or automatic discovery. Every process in these cgroups
+can reach primary UDN pods. All paths must exist on each node. See the
+[UDN host isolation documentation](../../docs/features/user-defined-networks/user-defined-networks.md)
+for validation and restart behavior.
